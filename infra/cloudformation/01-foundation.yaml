@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StreamFlow Cloud - Phase 1 Foundation Stack
+  Creates Cognito User Pool, S3 video bucket, DynamoDB metadata table,
+  and the base IAM roles that later Lambda functions will assume.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamflow
+    Description: Lowercase prefix used to name all resources.
+
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+
+Resources:
+
+  # ---------------- Cognito ----------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-${EnvName}-users"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-${EnvName}-web-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+
+  # ---------------- S3: video storage ----------------
+  VideoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-videos-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [PUT, GET]
+            AllowedOrigins: ["*"]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 3
+
+  # NOTE: the bucket policy (deny-insecure-transport + CloudFront OAC access)
+  # is owned by 02-cloudfront.yaml, since it must reference the CloudFront
+  # distribution. A bucket can only have one BucketPolicy resource attached,
+  # so don't add one here.
+
+  # ---------------- DynamoDB: video metadata ----------------
+  VideoMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-${EnvName}-video-metadata"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: videoId
+          AttributeType: S
+        - AttributeName: ownerId
+          AttributeType: S
+        - AttributeName: uploadedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: videoId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: owner-index
+          KeySchema:
+            - AttributeName: ownerId
+              KeyType: HASH
+            - AttributeName: uploadedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------------- SNS: notifications ----------------
+  NotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${EnvName}-notifications"
+
+  # ---------------- IAM: base execution role for Lambda functions ----------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: scoped-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Sid: S3VideoBucketOnly
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${VideoBucket}/*"
+              - Sid: DynamoDBMetadataTableOnly
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt VideoMetadataTable.Arn
+                  - !Sub "${VideoMetadataTable.Arn}/index/*"
+              - Sid: PublishNotifications
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationsTopic
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-UserPoolId" }
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-UserPoolClientId" }
+  VideoBucketName:
+    Value: !Ref VideoBucket
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-VideoBucketName" }
+  VideoBucketArn:
+    Value: !GetAtt VideoBucket.Arn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-VideoBucketArn" }
+  VideoBucketRegionalDomainName:
+    Value: !GetAtt VideoBucket.RegionalDomainName
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-VideoBucketRegionalDomainName" }
+  VideoMetadataTableName:
+    Value: !Ref VideoMetadataTable
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-VideoMetadataTableName" }
+  LambdaExecutionRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-LambdaExecutionRoleArn" }
+  NotificationsTopicArn:
+    Value: !Ref NotificationsTopic
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-NotificationsTopicArn" }

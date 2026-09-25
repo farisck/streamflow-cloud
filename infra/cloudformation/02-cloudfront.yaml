@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StreamFlow Cloud - Phase 2 CloudFront Stack
+  Creates a CloudFront distribution in front of the video bucket using
+  Origin Access Control (OAC), and owns the bucket policy that locks
+  the bucket down to CloudFront-only, HTTPS-only access.
+  Imports outputs from 01-foundation.yaml.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamflow
+
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: >
+      PriceClass_100 = North America + Europe only (cheapest, recommended
+      for a Free Tier / demo project). PriceClass_All = every edge location
+      worldwide (best performance, highest potential pay-as-you-go cost).
+
+Resources:
+
+  VideoOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${EnvName}-video-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  VideoDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName}-${EnvName} video streaming distribution"
+        HttpVersion: http2
+        PriceClass: !Ref CloudFrontPriceClass
+        DefaultRootObject: ""
+        Origins:
+          - Id: video-bucket-origin
+            DomainName:
+              Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketRegionalDomainName"
+            OriginAccessControlId: !GetAtt VideoOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: video-bucket-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed cache policy: CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # Managed origin request policy: CORS-S3Origin
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf
+        Logging:
+          Bucket: !GetAtt LogsBucket.RegionalDomainName
+          Prefix: cloudfront/
+          IncludeCookies: false
+
+  # Separate bucket for CloudFront access logs (kept small + short retention)
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-cf-logs-${AWS::AccountId}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogsAfter14Days
+            Status: Enabled
+            ExpirationInDays: 14
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontLogDelivery
+            Effect: Allow
+            Principal: { Service: delivery.logs.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${LogsBucket.Arn}/cloudfront/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+                "aws:SourceAccount": !Ref AWS::AccountId
+
+  # The single bucket policy for the video bucket: HTTPS-only, and readable
+  # ONLY by this specific CloudFront distribution via OAC. No other principal,
+  # including the bucket owner's public URL, can read objects directly.
+  VideoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketName"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketArn"
+              - !Sub
+                - "${Arn}/*"
+                - Arn: { Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketArn" }
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub
+              - "${Arn}/*"
+              - Arn: { Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketArn" }
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${VideoDistribution}"
+
+Outputs:
+  DistributionId:
+    Value: !Ref VideoDistribution
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DistributionId" }
+  DistributionDomainName:
+    Value: !GetAtt VideoDistribution.DomainName
+    Description: The CloudFront URL videos will be streamed from, e.g. https://d123abc.cloudfront.net
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-DistributionDomainName" }
+  LogsBucketName:
+    Value: !Ref LogsBucket
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-LogsBucketName" }
