@@ -182,6 +182,9 @@ Outputs:
   VideoMetadataTableName:
     Value: !Ref VideoMetadataTable
     Export: { Name: !Sub "${ProjectName}-${EnvName}-VideoMetadataTableName" }
+  VideoMetadataTableArn:
+    Value: !GetAtt VideoMetadataTable.Arn
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-VideoMetadataTableArn" }
   LambdaExecutionRoleArn:
     Value: !GetAtt LambdaExecutionRole.Arn
     Export: { Name: !Sub "${ProjectName}-${EnvName}-LambdaExecutionRoleArn" }

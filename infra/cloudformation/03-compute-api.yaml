@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StreamFlow Cloud - Phase 3 Compute & API Stack
+  Lambda functions for upload handling + an HTTP API Gateway with a Cognito
+  JWT authorizer. Imports outputs from 01-foundation.yaml. Does NOT depend on
+  02-cloudfront.yaml, so this can be deployed while the CloudFront account
+  verification is still pending.
+
+  NOTE: this template uses local-path `Code:` properties, which only resolve
+  after running `aws cloudformation package` (see repo README). Deploying
+  this file directly, unpackaged, will fail.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamflow
+
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+
+Resources:
+
+  # ---------------- IAM: one scoped role per function ----------------
+
+  PresignedUrlFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-presigned-url-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: scoped-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "arn:aws:logs:*:*:*"
+              - Sid: PutOnlyToVideoBucket
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub
+                  - "${Arn}/uploads/*"
+                  - Arn: { Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketArn" }
+              - Sid: WriteMetadataTable
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableArn"
+
+  ProcessUploadFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-process-upload-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: scoped-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "arn:aws:logs:*:*:*"
+              - Sid: ReadAndDeleteVideoObjects
+                Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub
+                  - "${Arn}/uploads/*"
+                  - Arn: { Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoBucketArn" }
+              - Sid: UpdateMetadataTable
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableArn"
+              - Sid: PublishNotifications
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  CustomResourceS3NotifyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-s3-notify-cr-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: scoped-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "arn:aws:logs:*:*:*"
+              - Sid: ManageBucketNotificationConfig
+                Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !ImportValue
+                  Fn::Sub: "${ProjectName}-${EnvName}-VideoBucketArn"
+
+  # ---------------- Lambda functions ----------------
+
+  PresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvName}-generate-presigned-url"
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt PresignedUrlFunctionRole.Arn
+      Code: ../../lambda/generate_presigned_url
+      Environment:
+        Variables:
+          VIDEO_BUCKET_NAME: !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-VideoBucketName"
+          METADATA_TABLE_NAME: !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableName"
+          URL_EXPIRY_SECONDS: "300"
+
+  PresignedUrlFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PresignedUrlFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ProcessUploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvName}-process-upload"
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt ProcessUploadFunctionRole.Arn
+      Code: ../../lambda/process_upload
+      Environment:
+        Variables:
+          METADATA_TABLE_NAME: !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableName"
+          NOTIFICATIONS_TOPIC_ARN: !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+          MAX_UPLOAD_SIZE_BYTES: "524288000"
+
+  ProcessUploadFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProcessUploadFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ProcessUploadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessUploadFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !ImportValue
+        Fn::Sub: "${ProjectName}-${EnvName}-VideoBucketArn"
+      SourceAccount: !Ref AWS::AccountId
+
+  CustomResourceS3NotifyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvName}-s3-notify-custom-resource"
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt CustomResourceS3NotifyRole.Arn
+      Code: ../../lambda/custom_resource_s3_notify
+
+  CustomResourceS3NotifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CustomResourceS3NotifyFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Wires the bucket (created in the Foundation stack) to invoke
+  # ProcessUploadFunction on new objects under uploads/. Must run after the
+  # invoke permission exists, or S3 will reject the notification config.
+  S3BucketNotificationConfig:
+    Type: Custom::S3BucketNotification
+    DependsOn: ProcessUploadInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceS3NotifyFunction.Arn
+      BucketName: !ImportValue
+        Fn::Sub: "${ProjectName}-${EnvName}-VideoBucketName"
+      LambdaArn: !GetAtt ProcessUploadFunction.Arn
+      UploadPrefix: "uploads/"
+
+  # ---------------- HTTP API + Cognito JWT authorizer ----------------
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-${EnvName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: !Sub "${ProjectName}-${EnvName}-cognito-jwt"
+      AuthorizerType: JWT
+      IdentitySource: ["$request.header.Authorization"]
+      JwtConfiguration:
+        Audience:
+          - !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-UserPoolClientId"
+        Issuer: !Sub
+          - "https://cognito-idp.${AWS::Region}.amazonaws.com/${PoolId}"
+          - PoolId: !ImportValue
+              Fn::Sub: "${ProjectName}-${EnvName}-UserPoolId"
+
+  PresignedUrlIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PresignedUrlFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  UploadUrlRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /videos/upload-url"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${PresignedUrlIntegration}"
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PresignedUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+Outputs:
+  ApiEndpoint:
+    Description: Base URL of the HTTP API - call POST {ApiEndpoint}/videos/upload-url
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Export: { Name: !Sub "${ProjectName}-${EnvName}-ApiEndpoint" }
+  PresignedUrlFunctionName:
+    Value: !Ref PresignedUrlFunction
+  ProcessUploadFunctionName:
+    Value: !Ref ProcessUploadFunction
