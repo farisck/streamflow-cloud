@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  StreamFlow Cloud - Phase 4 Monitoring Stack
+  CloudWatch alarms on the Lambda functions and DynamoDB table, a
+  multi-region CloudTrail, and an AWS Budget - all alerting to the existing
+  SNS topic from the Foundation stack. Deliberately self-contained: rather
+  than adding new exports to 03-compute-api.yaml, Lambda function names are
+  reconstructed from ProjectName/EnvName (they're deterministic - see that
+  template's FunctionName properties), so this stack has no dependency on
+  Phase 3's exports and can be deployed/updated independently.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: streamflow
+
+  EnvName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+
+  MonthlyBudgetLimitUSD:
+    Type: Number
+    Default: 10
+    Description: Monthly cost threshold in USD that triggers Budgets alerts.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. If set, subscribes this address to the SNS notifications
+      topic (requires a one-time confirmation click in the subscriber's
+      inbox). Leave blank to skip and subscribe manually later.
+
+  TrailLogRetentionDays:
+    Type: Number
+    Default: 90
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+
+  # ---------------- Optional email subscription on the existing topic ----------------
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !ImportValue
+        Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------- CloudWatch alarms ----------------
+
+  GeneratePresignedUrlErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-presigned-url-errors"
+      AlarmDescription: Fires if generate_presigned_url throws any error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${ProjectName}-${EnvName}-generate-presigned-url"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  ProcessUploadErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-process-upload-errors"
+      AlarmDescription: Fires if process_upload throws any error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${ProjectName}-${EnvName}-process-upload"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  ListVideosErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-list-videos-errors"
+      AlarmDescription: Fires if list_videos throws any error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub "${ProjectName}-${EnvName}-list-videos"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${EnvName}-dynamodb-throttles"
+      AlarmDescription: Fires if the metadata table (or a GSI) throttles any request.
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableName"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  # ---------------- CloudTrail ----------------
+
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${EnvName}-cloudtrail-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTrailLogsAfterRetention
+            Status: Enabled
+            ExpirationInDays: !Ref TrailLogRetentionDays
+
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+          - Sid: AllowCloudTrailWriteLogs
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+
+  AccountTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailLogsBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-${EnvName}-trail"
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      IsLogging: true
+
+  # ---------------- AWS Budgets ----------------
+
+  BudgetsSnsPublishPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal: { Service: budgets.amazonaws.com }
+            Action: sns:Publish
+            Resource: !ImportValue
+              Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: BudgetsSnsPublishPolicy
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-${EnvName}-monthly-budget"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimitUSD
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !ImportValue
+                Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !ImportValue
+                Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+Outputs:
+  CloudTrailLogsBucketName:
+    Value: !Ref CloudTrailLogsBucket
+  TrailArn:
+    Value: !GetAtt AccountTrail.Arn
