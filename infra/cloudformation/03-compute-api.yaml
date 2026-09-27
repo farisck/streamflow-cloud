@@ -7,8 +7,8 @@ Description: >
   verification is still pending.
 
   NOTE: this template uses local-path `Code:` properties, which only resolve
-  after running `aws cloudformation package` (see repo README). Deploying
-  this file directly, unpackaged, will fail.
+  after running `aws cloudformation package` (see repo README). Deploying this
+  file directly, unpackaged, will fail.
 
 Parameters:
   ProjectName:
@@ -94,6 +94,38 @@ Resources:
                 Action: sns:Publish
                 Resource: !ImportValue
                   Fn::Sub: "${ProjectName}-${EnvName}-NotificationsTopicArn"
+
+  ListVideosFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${EnvName}-list-videos-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: scoped-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "arn:aws:logs:*:*:*"
+              - Sid: ReadMetadataTable
+                Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableArn"
+                  - !Sub
+                    - "${TableArn}/index/owner-index"
+                    - TableArn: { Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoMetadataTableArn" }
+                  - !Sub
+                    - "${TableArn}/index/status-index"
+                    - TableArn: { Fn::ImportValue: !Sub "${ProjectName}-${EnvName}-VideoMetadataTableArn" }
 
   CustomResourceS3NotifyRole:
     Type: AWS::IAM::Role
@@ -199,6 +231,28 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${CustomResourceS3NotifyFunction}"
       RetentionInDays: !Ref LogRetentionDays
 
+  ListVideosFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${EnvName}-list-videos"
+      Runtime: python3.12
+      Handler: app.handler
+      Timeout: 10
+      MemorySize: 256
+      Role: !GetAtt ListVideosFunctionRole.Arn
+      Code: ../../lambda/list_videos
+      Environment:
+        Variables:
+          METADATA_TABLE_NAME: !ImportValue
+            Fn::Sub: "${ProjectName}-${EnvName}-VideoMetadataTableName"
+          DEFAULT_PAGE_SIZE: "20"
+
+  ListVideosFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ListVideosFunction}"
+      RetentionInDays: !Ref LogRetentionDays
+
   # Wires the bucket (created in the Foundation stack) to invoke
   # ProcessUploadFunction on new objects under uploads/. Must run after the
   # invoke permission exists, or S3 will reject the notification config.
@@ -265,6 +319,31 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
 
+  ListVideosIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ListVideosFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ListVideosRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /videos"
+      AuthorizationType: JWT
+      AuthorizerId: !Ref CognitoAuthorizer
+      Target: !Sub "integrations/${ListVideosIntegration}"
+
+  ListVideosInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListVideosFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
   HttpApiStage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
@@ -281,3 +360,5 @@ Outputs:
     Value: !Ref PresignedUrlFunction
   ProcessUploadFunctionName:
     Value: !Ref ProcessUploadFunction
+  ListVideosFunctionName:
+    Value: !Ref ListVideosFunction

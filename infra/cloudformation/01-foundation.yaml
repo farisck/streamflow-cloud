@@ -96,6 +96,8 @@ Resources:
           AttributeType: S
         - AttributeName: uploadedAt
           AttributeType: S
+        - AttributeName: status
+          AttributeType: S
       KeySchema:
         - AttributeName: videoId
           KeyType: HASH
@@ -103,6 +105,14 @@ Resources:
         - IndexName: owner-index
           KeySchema:
             - AttributeName: ownerId
+              KeyType: HASH
+            - AttributeName: uploadedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
               KeyType: HASH
             - AttributeName: uploadedAt
               KeyType: RANGE

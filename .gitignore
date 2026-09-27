@@ -32,3 +32,13 @@ Thumbs.db
 
 # Local test payloads that may contain real sample data
 /test-events/local-only/
+
+body.json
+key.json
+deployed-*.yaml
+*.packaged.yaml
+
+body.json
+key.json
+deployed-*.yaml
+*.packaged.yaml
