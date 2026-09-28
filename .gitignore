@@ -42,3 +42,9 @@ body.json
 key.json
 deployed-*.yaml
 *.packaged.yaml
+
+body.json
+key.json
+env.json
+bad-event.json
+out.json
